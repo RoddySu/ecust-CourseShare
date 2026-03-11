@@ -1,0 +1,216 @@
+$:
+  vscode:
+    - runner:
+        cpus: 1
+      docker:
+        # 指定开发环境镜像，可以是任意可访问的镜像。
+        # 如果 image 指定的镜像中已安装 code-server 代码服务，将使用单容器模式启动开发环境
+        # 如果 image 指定的镜像中未安装 code-server 代码服务，将使用双容器模式启动开发环境
+        # 如下镜像为 CNB 默认开发环境镜像，已安装代码服务，将使用单容器模式启动开发环境
+        # 可按需替换为其他镜像
+        image: cnbcool/default-dev-env:latest
+      services:
+        - vscode
+        - docker
+
+master:
+  push:
+    - name: sync
+      runner:
+        cpus: 1
+      imports: 
+        - https://cnb.cool/ecustcic/key/-/blob/main/env.yml
+      stages:
+        - name: Check Conflict & Push
+          script: |
+            git config --global user.name "$GITHUB_USERNAME"
+            git config --global user.email "$MAIL"
+            git remote add github https://$GITHUB_USERNAME:$GITHUB_ACCESS_TOKEN@github.com/tianyilt/ecust-CourseShare.git
+            
+            echo "🔍 1. 获取 GitHub 最新状态..."
+            git fetch github master
+            
+            if ! git pull --rebase github master; then
+              echo "❌ 冲突检测：GitHub 上有与本地冲突的修改！"
+              echo "⚠️ 请先手动在本地解决冲突，或者在 GitHub 上解决后再尝试。"
+              exit 1 # 退出脚本，防止错误推送
+            fi
+            
+            echo "✅ 合并成功（或者无冲突），准备推送..."
+
+            # --- 推送 ---
+            git push origin master
+            echo "✅ 已推送到当前平台"
+            git push github master
+            echo "🚀 已成功同步到 GitHub"
+
+  # 定时任务配置
+  "crontab: 0 2 */7 * *":  # 每7天凌晨2点执行
+    - name: sync from github
+      runner:
+        cpus: 1
+      imports:
+        - https://cnb.cool/ecustcic/key/-/blob/main/webdav.yml
+      stages:
+        - name: setup-git
+          script: |
+            git remote add upstream https://github.com/tianyilt/ecust-CourseShare.git
+            
+            # 1. 记录更新前的 Commit ID
+            BEFORE_SHA=$(git rev-parse HEAD)
+            
+            git fetch upstream master
+            if ! git pull --rebase upstream master; then
+               echo "⛔️ 自动合并失败，存在冲突，跳过本次更新。"
+               exit 1
+            fi
+
+            # 2. 记录更新后的 Commit ID
+            AFTER_SHA=$(git rev-parse HEAD)
+
+            # 3. 核心判断：如果无变更，直接退出 Pipeline
+            if [ "$BEFORE_SHA" == "$AFTER_SHA" ]; then
+                echo "😴 代码无变更，任务提前结束 (Exit 78)。"
+                exit 78
+            fi
+            
+            echo "✅ 检测到代码变更，将更新推送到 CNB 仓库并继续后续 WebDAV 同步..."
+            git push origin master
+        
+        - name: Check & Install Rclone
+          script: |
+            sed -i 's/deb.debian.org/mirrors.tencentyun.com/g' /etc/apt/sources.list.d/debian.sources
+            apt update
+            # 确保安装 curl
+            apt install unzip dnsutils curl -y
+            
+            # DNS 修正逻辑 (保留原样)
+            nslookup $WEBDAV_CNAME | grep 'Address:' | tail -n1 | awk -v host="$WEBDAV_HOST" '{print $2 " " host}' >> /etc/hosts
+            
+            # -------------------------------------------------------
+            # [新增] 状态码前置检查
+            # -------------------------------------------------------
+            echo "🔍 正在检查 WebDAV 连通性: $WEBDAV_URL"
+            
+            # 获取状态码 (--max-time 3 防止服务器无响应卡住)
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$WEBDAV_URL")
+            
+            if [ "$HTTP_CODE" != "401" ]; then
+              echo "⛔️ 检测到 WebDAV 状态码为: $HTTP_CODE"
+              echo "⚠️ 目标非 401 状态，停止后续任务以节省资源。"
+              exit 1  # 退出码 1 会强制终止 Pipeline，后续的 Sync Stage 不会执行
+            fi
+            
+            echo "✅ WebDAV 状态码为 401，服务正常，继续执行安装..."
+            # -------------------------------------------------------
+
+            curl https://cnb.cool/bestzyq/rclone/-/git/raw/main/install.sh | bash
+
+            echo "🧹 清理空文件和空目录..."
+            find . -type f -empty -not -path "./.git/*" -delete
+            while [ -n "$(find . -type d -empty -not -path "./.git" -not -path "./.git/*" -print -quit)" ]; do
+              find . -type d -empty -not -path "./.git" -not -path "./.git/*" -delete
+            done
+
+        - name: Rclone Sync to WebDAV
+          timeout: 12h
+          script: |
+            # 配置 Rclone WebDAV
+            rclone config create mycloud webdav url=$WEBDAV_URL vendor=other user=$WEBDAV_USER pass=$WEBDAV_PASSWORD
+            
+            # 开始同步
+            rclone sync . mycloud:$WEBDAV_PATH \
+              --exclude ".git/**" \
+              --exclude ".github/**" \
+              --transfers 8 \
+              --retries 3 \
+              --retries-sleep 5s \
+              --size-only \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            echo "✅ 已同步到webdav"
+
+            rclone check . mycloud:$WEBDAV_PATH \
+              --exclude ".git/**" \
+              --exclude ".github/**" \
+              --size-only
+            echo "✅ 已check"
+  
+  # Web触发器配置 (同理修改 manual-sync-webdav)
+  web_trigger:
+    - name: manual-sync-github
+      runner:
+        cpus: 1
+      stages:
+        - name: setup-git
+          script: |
+            git remote add upstream https://github.com/tianyilt/ecust-CourseShare.git
+            git fetch upstream
+            git checkout master
+            git reset --hard upstream/master
+            git push origin master --force
+            echo "✅ 已同步 GitHub 的 master 分支到 cnb.cool 仓库"
+            
+  web_trigger_2:
+    - name: manual-sync-cnb
+      runner:
+        cpus: 1
+      imports: https://cnb.cool/ecustcic/key/-/blob/main/env.yml
+      stages:
+        - name: sync to github
+          image: tencentcom/git-sync
+          settings:
+            target_url: https://github.com/tianyilt/ecust-CourseShare.git
+            auth_type: https
+            username: ${GITHUB_USERNAME}
+            password: ${GITHUB_ACCESS_TOKEN}
+            force: true
+
+  web_trigger_1:
+    - name: manual-sync-webdav
+      runner:
+        cpus: 1
+      imports:
+        - https://cnb.cool/ecustcic/key/-/blob/main/webdav.yml
+      stages:
+        - name: Check & Install Rclone
+          script: |
+            sed -i 's/deb.debian.org/mirrors.tencentyun.com/g' /etc/apt/sources.list.d/debian.sources
+            apt update
+            apt install unzip dnsutils curl -y
+            nslookup $WEBDAV_CNAME | grep 'Address:' | tail -n1 | awk -v host="$WEBDAV_HOST" '{print $2 " " host}' >> /etc/hosts
+            
+            # --- 检查逻辑 ---
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$WEBDAV_URL")
+            if [ "$HTTP_CODE" != "401" ]; then
+              echo "⛔️ 状态码 $HTTP_CODE (非401)，停止执行。"
+              exit 1
+            fi
+            # ---------------
+
+            curl https://cnb.cool/bestzyq/rclone/-/git/raw/main/install.sh | bash
+
+            echo "🧹 清理空文件和空目录..."
+            find . -type f -empty -not -path "./.git/*" -delete
+            while [ -n "$(find . -type d -empty -not -path "./.git" -not -path "./.git/*" -print -quit)" ]; do
+              find . -type d -empty -not -path "./.git" -not -path "./.git/*" -delete
+            done
+        - name: Rclone Sync to WebDAV
+          timeout: 12h
+          script: |
+            # 配置 Rclone WebDAV
+            rclone config create mycloud webdav url=$WEBDAV_URL vendor=other user=$WEBDAV_USER pass=$WEBDAV_PASSWORD
+            # 开始同步
+            rclone sync . mycloud:$WEBDAV_PATH \
+              --exclude ".git/**" \
+              --exclude ".github/**" \
+              --transfers 8 \
+              --retries 3 \
+              --retries-sleep 5s \
+              --size-only \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            echo "✅ 已同步到webdav"
+            rclone check . mycloud:$WEBDAV_PATH \
+              --exclude ".git/**" \
+              --exclude ".github/**" \
+              --size-only
+            echo "✅ 已check"
